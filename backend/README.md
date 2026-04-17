@@ -27,6 +27,7 @@
   - `production_event` 生产事件
   - `quality_record` 质检记录
   - `kpi_snapshot` KPI 快照
+  - `GET /schedule/actual-timeline` 可还原实际执行时序（含返修回流）
 - 接口层：
   - 统一返回结构：`{code, message, data}`
   - `/docs` 可直接联调
@@ -162,4 +163,3 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 - `work_order`、`schedule_task`、`production_event` 相关命名不要私自改
 - 任何影响 B/C 的接口改动，需要当天同步通知
 - A 的职责是“稳定底座”，不要把页面逻辑写进后端，也不要把 B 的算法耦合进接口层
-

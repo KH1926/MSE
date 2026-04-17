@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -15,6 +16,25 @@ def get_connection() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
+
+
+@contextmanager
+def write_transaction() -> sqlite3.Connection:
+    """
+    核心写链路统一事务包裹：
+    - BEGIN EXCLUSIVE：写入期间独占锁，避免并发写冲突
+    - 异常自动 ROLLBACK：避免中途失败导致脏写
+    """
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN EXCLUSIVE;")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db() -> None:

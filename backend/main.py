@@ -10,11 +10,11 @@ from pydantic import BaseModel, Field
 
 try:
     # 兼容在 backend 目录内直接运行：uvicorn main:app
-    from db import DB_PATH, get_connection, init_db, query_all, query_one
+    from db import DB_PATH, get_connection, init_db, query_all, query_one, write_transaction
     from simulation_strategy import SimulationStrategy, load_strategy
 except ModuleNotFoundError:
     # 兼容在项目根目录按包运行：uvicorn backend.main:app
-    from .db import DB_PATH, get_connection, init_db, query_all, query_one
+    from .db import DB_PATH, get_connection, init_db, query_all, query_one, write_transaction
     from .simulation_strategy import SimulationStrategy, load_strategy
 
 DATETIME_FMT = "%Y-%m-%d %H:%M:%S"
@@ -148,7 +148,7 @@ def get_station_params(conn) -> dict[str, dict[str, Any]]:
     rows = query_all(
         conn,
         """
-        SELECT station_id, min_time, mode_time, max_time, sigma
+        SELECT station_id, min_time, mode_time, max_time, sigma, capacity
         FROM station
         """,
     )
@@ -214,6 +214,68 @@ def get_material_precheck(
             }
         )
     return result
+
+
+def consume_station_materials(
+    conn,
+    *,
+    product_code: str,
+    station_id: str,
+    work_order_quantity: int,
+    consume_time: str,
+) -> tuple[bool, list[dict[str, Any]]]:
+    """
+    在工位开工前执行扣料：
+    - 物料充足：一次性扣减并更新 inventory.updated_at
+    - 物料不足：不扣料，返回不足明细
+    """
+    bom_rows = query_all(
+        conn,
+        """
+        SELECT b.material_code, b.qty_per_unit
+        FROM bom b
+        WHERE b.product_code = ? AND b.consume_station_id = ?
+        ORDER BY b.material_code
+        """,
+        (product_code, station_id),
+    )
+    if not bom_rows:
+        return True, []
+
+    conn.execute("SAVEPOINT consume_station_materials;")
+    shortage_rows: list[dict[str, Any]] = []
+    for row in bom_rows:
+        required_qty = float(row["qty_per_unit"]) * float(work_order_quantity)
+        material_code = row["material_code"]
+        updated = conn.execute(
+            """
+            UPDATE inventory
+            SET current_qty = current_qty - ?, updated_at = ?
+            WHERE material_code = ? AND current_qty >= ?
+            """,
+            (required_qty, consume_time, material_code, required_qty),
+        )
+        if updated.rowcount == 0:
+            qty_row = query_one(
+                conn,
+                "SELECT COALESCE(current_qty, 0) AS current_qty FROM inventory WHERE material_code = ?",
+                (material_code,),
+            )
+            shortage_rows.append(
+                {
+                    "material_code": material_code,
+                    "required_qty": required_qty,
+                    "current_qty": float(qty_row["current_qty"]) if qty_row else 0.0,
+                }
+            )
+
+    if shortage_rows:
+        conn.execute("ROLLBACK TO SAVEPOINT consume_station_materials;")
+        conn.execute("RELEASE SAVEPOINT consume_station_materials;")
+        return False, shortage_rows
+
+    conn.execute("RELEASE SAVEPOINT consume_station_materials;")
+    return True, []
 
 
 def compute_and_store_kpi(conn, scenario: str) -> dict[str, Any]:
@@ -338,7 +400,11 @@ class BuiltinSimulationStrategy:
         pending_tasks = query_all(
             conn,
             """
-            SELECT st.*, wo.order_no
+            SELECT
+                st.*,
+                wo.order_no,
+                wo.product_code,
+                wo.quantity
             FROM schedule_task st
             JOIN work_order wo ON wo.work_order_no = st.work_order_no
             WHERE st.status = ?
@@ -385,7 +451,11 @@ class BuiltinSimulationStrategy:
         tasks = [t for t in pending_tasks if t["work_order_no"] in selected_set]
         station_params = get_station_params(conn)
 
-        base_time = datetime.now()
+        # 仿真时间轴与排产时间轴统一参照最早 planned_start，避免计划/实际甘特图错位。
+        planned_time_candidates = [
+            parse_datetime(t["planned_start"]) for t in tasks if t["planned_start"]
+        ]
+        base_time = min(planned_time_candidates) if planned_time_candidates else datetime.now()
         station_available_min: dict[str, float] = {
             row["station_id"]: 0.0
             for row in query_all(conn, "SELECT station_id FROM station")
@@ -396,6 +466,7 @@ class BuiltinSimulationStrategy:
         work_order_scrapped: set[str] = set()
         work_order_repair_count: dict[str, int] = {}
         work_order_waiting_rework: set[str] = set()
+        work_order_waiting_material: set[str] = set()
         deferred_pack_task_by_work_order: dict[str, dict[str, Any]] = {}
 
         fault_injected = False
@@ -427,6 +498,10 @@ class BuiltinSimulationStrategy:
                     )
                 continue
 
+            if wo in work_order_waiting_material:
+                # 一旦某工位缺料，当前仿真周期内该工单后续任务均保持等待。
+                continue
+
             if station_id == PACK_STATION_ID and wo in work_order_waiting_rework:
                 # WS50 先挂起，待返修闭环在 WS40 判定 pass 后再执行。
                 deferred_pack_task_by_work_order.setdefault(wo, task)
@@ -442,6 +517,27 @@ class BuiltinSimulationStrategy:
                 station_available_min.get(station_id, 0.0),
                 work_order_available_min.get(wo, 0.0),
             )
+            actual_start = (base_time + timedelta(minutes=start_min)).strftime(DATETIME_FMT)
+
+            can_consume_material, _ = consume_station_materials(
+                conn,
+                product_code=task["product_code"],
+                station_id=station_id,
+                work_order_quantity=int(task["quantity"]),
+                consume_time=actual_start,
+            )
+            if not can_consume_material:
+                work_order_waiting_material.add(wo)
+                if task_id is not None:
+                    conn.execute(
+                        """
+                        UPDATE schedule_task
+                        SET status = ?
+                        WHERE id = ? AND status = ?
+                        """,
+                        (TASK_STATUS_PENDING, task_id, TASK_STATUS_PENDING),
+                    )
+                continue
 
             if (
                 payload.scenario == SCENARIO_S3_FAULT
@@ -501,7 +597,6 @@ class BuiltinSimulationStrategy:
             duration_min = duration_sec / 60.0
             end_min = start_min + duration_min
 
-            actual_start = (base_time + timedelta(minutes=start_min)).strftime(DATETIME_FMT)
             actual_end = (base_time + timedelta(minutes=end_min)).strftime(DATETIME_FMT)
 
             # 排产表仅维护主路线任务，返修回流任务只写事件/质检，不新增 schedule_task。
@@ -598,6 +693,8 @@ class BuiltinSimulationStrategy:
                             "id": None,
                             "work_order_no": wo,
                             "order_no": task["order_no"],
+                            "product_code": task["product_code"],
+                            "quantity": task["quantity"],
                             "station_id": REWORK_STATION_ID,
                             "sequence": 303,
                         }
@@ -607,6 +704,8 @@ class BuiltinSimulationStrategy:
                             "id": None,
                             "work_order_no": wo,
                             "order_no": task["order_no"],
+                            "product_code": task["product_code"],
+                            "quantity": task["quantity"],
                             "station_id": QC_STATION_ID,
                             "sequence": 404,
                         }
@@ -678,11 +777,24 @@ class BuiltinSimulationStrategy:
             work_order_available_min[wo] = end_min
 
         for wo in selected_work_orders:
-            final_status = (
-                WORK_ORDER_STATUS_SCRAPPED
-                if wo in work_order_scrapped
-                else WORK_ORDER_STATUS_COMPLETED
-            )
+            if wo in work_order_scrapped:
+                final_status = WORK_ORDER_STATUS_SCRAPPED
+            else:
+                has_pending_task = query_one(
+                    conn,
+                    """
+                    SELECT 1 AS flag
+                    FROM schedule_task
+                    WHERE work_order_no = ? AND status = ?
+                    LIMIT 1
+                    """,
+                    (wo, TASK_STATUS_PENDING),
+                )
+                if has_pending_task or wo in work_order_waiting_material or wo in work_order_waiting_rework:
+                    final_status = WORK_ORDER_STATUS_IN_PROGRESS
+                else:
+                    final_status = WORK_ORDER_STATUS_COMPLETED
+
             actual_start = work_order_start.get(wo)
             actual_end = work_order_end.get(wo)
             conn.execute(
@@ -725,12 +837,15 @@ class BuiltinSimulationStrategy:
             )
             if not order_row:
                 continue
-            order_status = ORDER_STATUS_COMPLETED
-            if final_status == WORK_ORDER_STATUS_COMPLETED and actual_end:
-                if datetime.strptime(actual_end, DATETIME_FMT).date() > datetime.strptime(
-                    order_row["due_date"], DATE_FMT
-                ).date():
-                    order_status = ORDER_STATUS_OVERDUE
+            if final_status == WORK_ORDER_STATUS_IN_PROGRESS:
+                order_status = ORDER_STATUS_IN_PRODUCTION
+            else:
+                order_status = ORDER_STATUS_COMPLETED
+                if final_status == WORK_ORDER_STATUS_COMPLETED and actual_end:
+                    if datetime.strptime(actual_end, DATETIME_FMT).date() > datetime.strptime(
+                        order_row["due_date"], DATE_FMT
+                    ).date():
+                        order_status = ORDER_STATUS_OVERDUE
             conn.execute(
                 "UPDATE sales_order SET order_status = ? WHERE order_no = ?",
                 (order_status, order_row["order_no"]),
@@ -773,7 +888,7 @@ def get_orders() -> dict[str, Any]:
 
 @app.post("/orders")
 def create_order(payload: OrderCreate) -> dict[str, Any]:
-    with get_connection() as conn:
+    with write_transaction() as conn:
         product = query_one(
             conn,
             "SELECT product_code FROM product WHERE product_code = ?",
@@ -801,14 +916,13 @@ def create_order(payload: OrderCreate) -> dict[str, Any]:
                 created_at,
             ),
         )
-        conn.commit()
         row = query_one(conn, "SELECT * FROM sales_order WHERE order_no = ?", (order_no,))
     return ok(row)
 
 
 @app.post("/orders/{order_no}/generate-work-order")
 def generate_work_order(order_no: str) -> dict[str, Any]:
-    with get_connection() as conn:
+    with write_transaction() as conn:
         order = query_one(
             conn,
             "SELECT * FROM sales_order WHERE order_no = ?",
@@ -855,7 +969,6 @@ def generate_work_order(order_no: str) -> dict[str, Any]:
             "UPDATE sales_order SET order_status = ? WHERE order_no = ?",
             (ORDER_STATUS_SCHEDULED, order_no),
         )
-        conn.commit()
         work_order = query_one(
             conn,
             "SELECT * FROM work_order WHERE work_order_no = ?",
@@ -866,7 +979,7 @@ def generate_work_order(order_no: str) -> dict[str, Any]:
 
 @app.post("/schedule")
 def run_schedule(payload: ScheduleRequest) -> dict[str, Any]:
-    with get_connection() as conn:
+    with write_transaction() as conn:
         work_orders = query_all(
             conn,
             """
@@ -983,8 +1096,6 @@ def run_schedule(payload: ScheduleRequest) -> dict[str, Any]:
             )
             scheduled_count += 1
 
-        conn.commit()
-
     return ok(
         {
             "scheduled_work_orders": scheduled_count,
@@ -1008,15 +1119,75 @@ def get_schedule_tasks() -> dict[str, Any]:
     return ok(rows)
 
 
+@app.get("/schedule/actual-timeline")
+def get_schedule_actual_timeline() -> dict[str, Any]:
+    """
+    返回基于 production_event 还原的实际执行时序（含返修回流），
+    供前端在甘特图中补齐 WS30/WS40 的重复执行片段。
+    """
+    with get_connection() as conn:
+        events = query_all(
+            conn,
+            """
+            SELECT work_order_no, station_id, event_type, event_time, id
+            FROM production_event
+            WHERE event_type IN (?, ?)
+            ORDER BY event_time ASC, id ASC
+            """,
+            (EVENT_START, EVENT_COMPLETE),
+        )
+
+    start_time_queue: dict[tuple[str, str], list[str]] = {}
+    run_counter: dict[tuple[str, str], int] = {}
+    timeline_rows: list[dict[str, Any]] = []
+
+    for event in events:
+        station_id = event["station_id"]
+        if not station_id:
+            continue
+        key = (event["work_order_no"], station_id)
+
+        if event["event_type"] == EVENT_START:
+            start_time_queue.setdefault(key, []).append(event["event_time"])
+            continue
+
+        queued_start_times = start_time_queue.get(key, [])
+        if not queued_start_times:
+            continue
+        actual_start = queued_start_times.pop(0)
+        actual_end = event["event_time"]
+        run_no = run_counter.get(key, 0) + 1
+        run_counter[key] = run_no
+
+        duration_min = (
+            parse_datetime(actual_end) - parse_datetime(actual_start)
+        ).total_seconds() / 60.0
+
+        timeline_rows.append(
+            {
+                "work_order_no": event["work_order_no"],
+                "station_id": station_id,
+                "run_no": run_no,
+                "actual_start": actual_start,
+                "actual_end": actual_end,
+                "duration_min": duration_min,
+                "is_rework_run": station_id in {REWORK_STATION_ID, QC_STATION_ID}
+                and run_no > 1,
+            }
+        )
+
+    timeline_rows.sort(key=lambda x: (x["actual_start"], x["work_order_no"], x["station_id"], x["run_no"]))
+    return ok(timeline_rows)
+
+
 @app.post("/simulation/run")
 def run_simulation(payload: SimulationRequest) -> dict[str, Any]:
     if payload.scenario not in SCENARIO_CODES:
         raise HTTPException(status_code=400, detail="scenario 仅支持 S1_normal/S2_rush/S3_fault")
 
-    with get_connection() as conn:
+    with write_transaction() as conn:
         strategy_result = ACTIVE_SIMULATION_STRATEGY.run(conn, payload)
         kpi = compute_and_store_kpi(conn, payload.scenario)
-        conn.commit()
 
     return ok({**strategy_result, "kpi_snapshot": kpi})
 
@@ -1090,108 +1261,101 @@ def get_kpi_compare() -> dict[str, Any]:
 @app.get("/stations/status")
 def get_station_status() -> dict[str, Any]:
     with get_connection() as conn:
-        stations = query_all(
+        rows = query_all(
             conn,
             """
-            SELECT station_id, station_name
-            FROM station
-            ORDER BY station_id ASC
+            SELECT
+                s.station_id,
+                s.station_name,
+                COALESCE(ev.fault_start_cnt, 0) AS fault_start_cnt,
+                COALESCE(ev.fault_end_cnt, 0) AS fault_end_cnt,
+                COALESCE(wm.waiting_material_cnt, 0) AS waiting_material_cnt,
+                COALESCE(ts.busy_cnt, 0) AS busy_cnt,
+                COALESCE(bl.blocked_cnt, 0) AS blocked_cnt,
+                COALESCE(ts.pending_cnt, 0) AS pending_cnt
+            FROM station s
+            LEFT JOIN (
+                SELECT
+                    station_id,
+                    SUM(CASE WHEN event_type = ? THEN 1 ELSE 0 END) AS fault_start_cnt,
+                    SUM(CASE WHEN event_type = ? THEN 1 ELSE 0 END) AS fault_end_cnt
+                FROM production_event
+                GROUP BY station_id
+            ) ev ON s.station_id = ev.station_id
+            LEFT JOIN (
+                SELECT
+                    st.station_id,
+                    SUM(
+                        CASE
+                            WHEN COALESCE(i.current_qty, 0) < (b.qty_per_unit * wo.quantity)
+                            THEN 1
+                            ELSE 0
+                        END
+                    ) AS waiting_material_cnt
+                FROM schedule_task st
+                JOIN work_order wo ON st.work_order_no = wo.work_order_no
+                JOIN bom b
+                  ON b.product_code = wo.product_code
+                 AND b.consume_station_id = st.station_id
+                LEFT JOIN inventory i ON b.material_code = i.material_code
+                WHERE st.status IN (?, ?)
+                GROUP BY st.station_id
+            ) wm ON s.station_id = wm.station_id
+            LEFT JOIN (
+                SELECT
+                    station_id,
+                    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS busy_cnt,
+                    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS pending_cnt
+                FROM schedule_task
+                GROUP BY station_id
+            ) ts ON s.station_id = ts.station_id
+            LEFT JOIN (
+                SELECT
+                    cur.station_id,
+                    SUM(CASE WHEN nxt.id IS NOT NULL THEN 1 ELSE 0 END) AS blocked_cnt
+                FROM schedule_task cur
+                LEFT JOIN schedule_task nxt
+                  ON cur.work_order_no = nxt.work_order_no
+                 AND nxt.sequence = cur.sequence + 1
+                 AND nxt.status = ?
+                WHERE cur.status = ?
+                GROUP BY cur.station_id
+            ) bl ON s.station_id = bl.station_id
+            ORDER BY s.station_id ASC
             """,
+            (
+                EVENT_FAULT_START,
+                EVENT_FAULT_END,
+                TASK_STATUS_PENDING,
+                TASK_STATUS_IN_PROGRESS,
+                TASK_STATUS_IN_PROGRESS,
+                TASK_STATUS_PENDING,
+                TASK_STATUS_PENDING,
+                TASK_STATUS_COMPLETED,
+            ),
         )
-        result = []
-        for station in stations:
-            sid = station["station_id"]
 
-            fault_start = query_one(
-                conn,
-                """
-                SELECT COUNT(*) AS n
-                FROM production_event
-                WHERE station_id = ? AND event_type = ?
-                """,
-                (sid, EVENT_FAULT_START),
-            )["n"]
-            fault_end = query_one(
-                conn,
-                """
-                SELECT COUNT(*) AS n
-                FROM production_event
-                WHERE station_id = ? AND event_type = ?
-                """,
-                (sid, EVENT_FAULT_END),
-            )["n"]
-            if fault_start > fault_end:
-                status = STATION_STATUS_FAULT
-            else:
-                waiting_material = query_one(
-                    conn,
-                    """
-                    SELECT 1 AS flag
-                    FROM bom b
-                    LEFT JOIN inventory i ON b.material_code = i.material_code
-                    WHERE b.consume_station_id = ?
-                      AND COALESCE(i.current_qty, 0) <= 0
-                    LIMIT 1
-                    """,
-                    (sid,),
-                )
-                if waiting_material:
-                    status = STATION_STATUS_WAITING_MATERIAL
-                else:
-                    busy_task = query_one(
-                        conn,
-                        """
-                        SELECT 1 AS flag
-                        FROM schedule_task
-                        WHERE station_id = ? AND status = ?
-                        LIMIT 1
-                        """,
-                        (sid, TASK_STATUS_IN_PROGRESS),
-                    )
-                    if busy_task:
-                        status = STATION_STATUS_BUSY
-                    else:
-                        blocked_task = query_one(
-                            conn,
-                            """
-                            SELECT 1 AS flag
-                            FROM schedule_task cur
-                            JOIN schedule_task nxt
-                              ON cur.work_order_no = nxt.work_order_no
-                             AND nxt.sequence = cur.sequence + 1
-                            WHERE cur.station_id = ?
-                              AND cur.status = ?
-                              AND nxt.status = ?
-                            LIMIT 1
-                            """,
-                            (sid, TASK_STATUS_COMPLETED, TASK_STATUS_PENDING),
-                        )
-                        if blocked_task:
-                            status = STATION_STATUS_BLOCKED
-                        else:
-                            pending_task = query_one(
-                                conn,
-                                """
-                                SELECT 1 AS flag
-                                FROM schedule_task
-                                WHERE station_id = ? AND status = ?
-                                LIMIT 1
-                                """,
-                                (sid, TASK_STATUS_PENDING),
-                            )
-                            # 状态判断顺序遵循协作契约：故障 > 缺料 > 加工中 > 堵塞 > 等待 > 空闲。
-                            status = (
-                                STATION_STATUS_WAITING
-                                if pending_task
-                                else STATION_STATUS_IDLE
-                            )
+    result = []
+    for row in rows:
+        if row["fault_start_cnt"] > row["fault_end_cnt"]:
+            status = STATION_STATUS_FAULT
+        elif row["waiting_material_cnt"] > 0:
+            status = STATION_STATUS_WAITING_MATERIAL
+        elif row["busy_cnt"] > 0:
+            status = STATION_STATUS_BUSY
+        elif row["blocked_cnt"] > 0:
+            status = STATION_STATUS_BLOCKED
+        elif row["pending_cnt"] > 0:
+            status = STATION_STATUS_WAITING
+        else:
+            status = STATION_STATUS_IDLE
 
-            result.append(
-                {
-                    "station_id": sid,
-                    "station_name": station["station_name"],
-                    "status": status,
-                }
-            )
+        result.append(
+            {
+                "station_id": row["station_id"],
+                "station_name": row["station_name"],
+                "status": status,
+            }
+        )
 
     return ok(result)

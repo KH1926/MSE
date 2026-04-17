@@ -146,3 +146,11 @@ CREATE TABLE kpi_snapshot (
     bottleneck_station TEXT NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_task_status
+ON schedule_task(work_order_no, status);
+
+CREATE INDEX IF NOT EXISTS idx_event_timeline
+ON production_event(event_time, event_type);
+
+CREATE INDEX IF NOT EXISTS idx_wo_order_no
+ON work_order(order_no);
