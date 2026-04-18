@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from db import get_connection, init_db
+try:
+    from db import get_connection, init_db
+except ModuleNotFoundError:
+    from .db import get_connection, init_db
 
 PRODUCT_CODE = "CAR-001"
 
